@@ -1189,6 +1189,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(api::switch_cockpit_agent),
         )
         .route(
+            "/api/sessions/{id}/cockpit/restart-agent",
+            post(api::restart_cockpit_agent),
+        )
+        .route(
             "/api/sessions/{id}/cockpit/prompt",
             post(api::cockpit_prompt),
         )

@@ -209,6 +209,133 @@ pub async fn shutdown_cockpit(
     }
 }
 
+/// `POST /api/sessions/{id}/cockpit/restart-agent`: tear down the
+/// running cockpit worker and respawn it against the SAME adapter
+/// command, preserving `cockpit_acp_session_id` so `session/load`
+/// resumes the conversation in-place. Use case: the user just
+/// upgraded `claude-agent-acp` (or any other adapter) on disk; the
+/// daemon's in-memory agent subprocess is still pinned to the old
+/// binary, including any wedges the new version fixes. Hitting this
+/// endpoint swaps it without taking the daemon down.
+///
+/// Differs from `switch_cockpit_agent` in two ways:
+///   - No `target` parameter; the agent name is read from the
+///     instance's current `cockpit_agent`.
+///   - `stored_acp_session_id` is preserved (not cleared) since the
+///     new agent process runs the same adapter and can `session/load`
+///     the cached id.
+///
+/// Differs from `shutdown_cockpit` + client-driven `spawn_cockpit`:
+///   - Atomic: the new worker is spawned inside this handler, so a
+///     concurrent reconciler tick can't observe the empty-workers
+///     window and respawn with stale sandbox state.
+///   - Synchronous: returns once the new worker has accepted the
+///     spawn, so the UI can rely on `cockpit_worker_state=resuming`
+///     by the time the next sessions poll lands.
+pub async fn restart_cockpit_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    if let Err(reason) = cockpit_gate(&state) {
+        return reason.into_response();
+    }
+
+    let instance = {
+        let instances = state.instances.read().await;
+        match instances.iter().find(|i| i.id == id).cloned() {
+            Some(inst) => inst,
+            None => return (StatusCode::NOT_FOUND, "session not found").into_response(),
+        }
+    };
+    let agent = state
+        .cockpit_supervisor
+        .pick_agent_for_tool(&instance.tool, instance.cockpit_agent.as_deref())
+        .await;
+
+    if let Err(e) = state
+        .cockpit_supervisor
+        .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("shutdown failed before agent restart: {e}"),
+        )
+            .into_response();
+    }
+
+    let cwd = PathBuf::from(&instance.project_path);
+    let inst_lock = state.instance_lock(&id).await;
+    let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
+        &state.instances,
+        &inst_lock,
+        &id,
+        false,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("sandbox container ensure failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let source_profile = sandbox_info
+        .as_ref()
+        .map(|_| instance.source_profile.clone());
+
+    match state
+        .cockpit_supervisor
+        .spawn(crate::cockpit::supervisor::SpawnRequest {
+            session_id: id.clone(),
+            agent: agent.clone(),
+            cwd,
+            additional_dirs: vec![],
+            provider_env: vec![],
+            model: instance.cockpit_model.clone(),
+            // PRESERVE the stored acp session id: same adapter as
+            // before, so `session/load` resumes the conversation
+            // without losing transcript or state.
+            stored_acp_session_id: instance.cockpit_acp_session_id.clone(),
+            sandbox_info,
+            source_profile,
+            yolo_mode: instance.yolo_mode,
+        })
+        .await
+    {
+        Ok(()) => Json(SpawnCockpitResponse {
+            session_id: id,
+            agent,
+            status: "running",
+        })
+        .into_response(),
+        Err(SupervisorError::UnknownAgent(name)) => (
+            StatusCode::BAD_REQUEST,
+            format!("unknown cockpit agent: {name}"),
+        )
+            .into_response(),
+        Err(SupervisorError::AlreadyRunning(_)) => (
+            StatusCode::CONFLICT,
+            "cockpit worker already running for session",
+        )
+            .into_response(),
+        Err(e @ SupervisorError::CapacityFull { .. }) => {
+            (StatusCode::SERVICE_UNAVAILABLE, format!("{e}")).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("respawn failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// One entry in the cockpit ACP registry. Names match the `target`
 /// field accepted by `/cockpit/switch-agent`. Used by the rate-limit
 /// recovery modal to list available backends. See #1282.

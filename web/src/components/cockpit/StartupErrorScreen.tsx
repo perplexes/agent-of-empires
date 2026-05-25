@@ -1,6 +1,9 @@
+import { useState } from "react";
+import { restartCockpitAgent } from "../../lib/api";
 import type { IncompatibleAgentDetail } from "../../lib/cockpitTypes";
 
 interface Props {
+  sessionId: string;
   detail: IncompatibleAgentDetail;
 }
 
@@ -10,11 +13,30 @@ interface Props {
  *  layered on top of the chat for free-form handshake failures. This
  *  screen surfaces the structured detail (installed vs required
  *  version, the exact remediation command) so the user can copy-paste
- *  it into a shell without parsing prose. */
-export function StartupErrorScreen({ detail }: Props) {
+ *  it into a shell without parsing prose, and a "Restart agent"
+ *  button that respawns the worker against the now-upgraded adapter
+ *  without an `aoe serve` restart. */
+export function StartupErrorScreen({ sessionId, detail }: Props) {
   const heading = headingFor(detail);
   const summary = summaryFor(detail);
   const installCommand = installCommandFor(detail);
+  const [restarting, setRestarting] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
+
+  const onRestart = async () => {
+    setRestarting(true);
+    setRestartError(null);
+    try {
+      await restartCockpitAgent(sessionId);
+      // The state.incompatibleAgent is cleared by the reducer when the
+      // next AcpSessionAssigned arrives from the freshly spawned
+      // worker. Nothing else to do here; this component unmounts
+      // automatically.
+    } catch (e) {
+      setRestartError(e instanceof Error ? e.message : String(e));
+      setRestarting(false);
+    }
+  };
 
   return (
     <div
@@ -33,7 +55,7 @@ export function StartupErrorScreen({ detail }: Props) {
         {installCommand && (
           <div className="mt-4">
             <div className="text-[11px] font-medium uppercase tracking-wide text-text-dim">
-              Run this, then restart the session
+              Run this, then click Restart agent below
             </div>
             <pre
               data-testid="startup-error-install-command"
@@ -46,15 +68,31 @@ export function StartupErrorScreen({ detail }: Props) {
 
         <DetailRows detail={detail} />
 
-        <div className="mt-4 text-xs text-text-dim">
-          The session is paused until the adapter satisfies the required
-          version. Once you have run the command above, restart{" "}
-          <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe serve</code>{" "}
-          (or spawn a fresh cockpit session) and the check re-runs at the next
-          ACP{" "}
-          <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">initialize</code>{" "}
-          handshake.
+        <div className="mt-5 flex items-center gap-3">
+          <button
+            type="button"
+            onClick={onRestart}
+            disabled={restarting}
+            data-testid="startup-error-restart-agent"
+            className="rounded-md bg-accent-600 px-3 py-1.5 text-sm font-medium text-text-primary shadow-sm hover:bg-accent-500 disabled:cursor-wait disabled:opacity-60"
+          >
+            {restarting ? "Restarting…" : "Restart agent"}
+          </button>
+          <span className="text-xs text-text-dim">
+            Tears down and respawns the cockpit worker against the current
+            adapter binary, preserving the conversation via{" "}
+            <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">
+              session/load
+            </code>
+            . No <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">aoe serve</code>{" "}
+            restart needed.
+          </span>
         </div>
+        {restartError && (
+          <div className="mt-3 text-xs text-status-error" data-testid="startup-error-restart-failure">
+            Restart failed: {restartError}
+          </div>
+        )}
       </div>
     </div>
   );

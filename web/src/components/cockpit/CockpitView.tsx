@@ -41,6 +41,7 @@ import { Composer } from "./Composer";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
 import { RateLimitRecoveryModal } from "./RateLimitRecoveryModal";
 import { Markdown } from "./Markdown";
+import { RestartAgentAction } from "./RestartAgentAction";
 import { SwitchSubstrateAction } from "./SwitchSubstrateAction";
 import {
   isQueuedPromptLong,
@@ -258,7 +259,7 @@ function CockpitChrome({
         className="flex h-full flex-col bg-surface-900 text-text-primary"
         style={rootStyle}
       >
-        <StartupErrorScreen detail={state.incompatibleAgent} />
+        <StartupErrorScreen sessionId={sessionId} detail={state.incompatibleAgent} />
       </div>
     );
   }
@@ -267,10 +268,13 @@ function CockpitChrome({
       className="relative flex h-full flex-col bg-surface-900 text-text-primary"
       style={rootStyle}
     >
-      {/* Top-right substrate switch — mirrors TerminalView. Always
-          rendered in cockpit mode: even with the master switch off,
-          users in cockpit need a path back to terminal. */}
-      <div className="absolute right-2 top-2 z-10">
+      {/* Top-right toolbar. RestartAgentAction surfaces the manual
+          adapter-restart path so an adapter upgrade can take effect
+          without an `aoe serve` restart (see api/cockpit.rs:
+          restart_cockpit_agent). SwitchSubstrateAction mirrors
+          TerminalView's escape hatch back to the tmux substrate. */}
+      <div className="absolute right-2 top-2 z-10 flex items-center gap-1">
+        <RestartAgentAction sessionId={sessionId} variant="icon" />
         <SwitchSubstrateAction
           sessionId={sessionId}
           cockpitMode={true}

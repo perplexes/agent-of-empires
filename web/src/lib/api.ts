@@ -460,6 +460,24 @@ export async function switchCockpitAgent(
   );
 }
 
+/** Tear down the cockpit worker for `sessionId` and respawn it
+ *  against the same adapter command. Preserves the stored ACP session
+ *  id, so the new worker resumes via `session/load` without losing
+ *  the transcript. Use when the user has just upgraded
+ *  `claude-agent-acp` (or any other adapter) on disk and wants the
+ *  in-memory agent subprocess to pick up the new binary without an
+ *  `aoe serve` restart. */
+export async function restartCockpitAgent(
+  sessionId: string,
+): Promise<SwitchAgentResponse | null> {
+  return fetchJson<SwitchAgentResponse>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/restart-agent`,
+    {
+      method: "POST",
+    },
+  );
+}
+
 /** Fetch a markdown primer built from events `seq < beforeSeq`. Used
  *  after a `session/load` failure: the agent's model context is empty
  *  but the transcript is intact in SQLite, so the user can opt in to
