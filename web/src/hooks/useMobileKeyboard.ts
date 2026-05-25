@@ -39,6 +39,15 @@ function readReservationSeed(): number {
 // shrinks when the keyboard opens and the App root's `100dvh` would shrink
 // with it; the App root applies this as an explicit pixel height instead so
 // the layout stays at the no-keyboard size. Reset on orientation change.
+//
+// keyboardOffset is the gap, in CSS pixels, between the App root's content-box
+// bottom (stableViewportHeight - safe-area-inset-bottom) and the visual
+// viewport's bottom (`vv.height + vv.offsetTop`). It is the padding-bottom a
+// pane needs so that a flex-bottom child (the cockpit composer) sits flush
+// with the keyboard top instead of behind it. Computed for both iOS regular
+// Safari (innerHeight stays, vvH shrinks) and iOS PWA / Android (innerHeight
+// shrinks with vvH but the App root is pinned to stableViewportHeight). 0
+// when the keyboard is closed.
 export function useMobileKeyboard() {
   const [isMobile, setIsMobile] = useState(() =>
     typeof window !== "undefined" &&
@@ -46,6 +55,7 @@ export function useMobileKeyboard() {
   );
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const [keyboardOffset, setKeyboardOffset] = useState(0);
   const [reservedKeyboardHeight, setReservedKeyboardHeight] =
     useState(readReservationSeed);
   const [stableViewportHeight, setStableViewportHeight] = useState(0);
@@ -80,6 +90,7 @@ export function useMobileKeyboard() {
 
     let lastOpen = false;
     let lastPadding = 0;
+    let lastOffset = 0;
 
     // Read the bottom safe-area inset once. The App root applies this as
     // padding, so the keyboard compensation should not include it.
@@ -139,6 +150,24 @@ export function useMobileKeyboard() {
       setStableViewportHeight((prev) =>
         heightCandidate > prev ? heightCandidate : prev,
       );
+
+      // keyboardOffset: gap between the App root's content-box bottom and
+      // the visual viewport bottom. Compute against fullHeightRef (the
+      // latched max innerHeight we ever saw) rather than the current
+      // innerHeight so this is correct in iOS-PWA mode where innerHeight
+      // shrinks alongside vv.height. Subtract safeBottom because the App
+      // root already pads its bottom by env(safe-area-inset-bottom); the
+      // home-indicator strip is physically occluded by the keyboard so we
+      // can stop there.
+      const targetBottom = currentVvH + (vv.offsetTop ?? 0);
+      const offset = Math.max(
+        0,
+        fullHeightRef.current - safeBottom - targetBottom,
+      );
+      if (offset !== lastOffset) {
+        lastOffset = offset;
+        setKeyboardOffset(offset);
+      }
       return totalOcclusion;
     };
 
@@ -191,6 +220,8 @@ export function useMobileKeyboard() {
       fullHeightRef.current = 0;
       setReservedKeyboardHeight(0);
       setStableViewportHeight(0);
+      setKeyboardOffset(0);
+      lastOffset = 0;
       if (orientTimer) clearTimeout(orientTimer);
       orientTimer = setTimeout(() => {
         fullHeightRef.current = Math.max(window.innerHeight, vv.height);
@@ -217,6 +248,7 @@ export function useMobileKeyboard() {
     isMobile,
     keyboardOpen,
     keyboardHeight,
+    keyboardOffset,
     reservedKeyboardHeight,
     stableViewportHeight,
   };
