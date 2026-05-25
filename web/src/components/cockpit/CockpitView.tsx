@@ -63,6 +63,7 @@ import {
 import { isClearAlias } from "../../lib/agentProfiles";
 import { useApprovalSound } from "../../hooks/useApprovalSound";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
+import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import type {
   Approval,
   ApprovalDecision,
@@ -234,6 +235,16 @@ function CockpitChrome({
       vp.removeEventListener("scroll", sampleAtBottom);
     };
   }, []);
+  // Reserve keyboard-occluded space at the bottom so the composer (flex
+  // bottom child) stays flush with the soft keyboard top. The App root is
+  // pinned to stableViewportHeight on mobile to keep the terminal pane
+  // stable across kb cycles; this padding undoes that pin locally for the
+  // cockpit subtree where the composer needs to ride above the keyboard.
+  // 0 on desktop and when the keyboard is closed.
+  const { keyboardOffset } = useMobileKeyboard();
+  const rootStyle = keyboardOffset > 0
+    ? { paddingBottom: `${keyboardOffset}px` }
+    : undefined;
   // Short-circuit: when the per-adapter compatibility check rejected
   // the adapter, replace the chat layout with a dedicated screen that
   // renders the exact remediation command. We never reach Running, so
@@ -242,13 +253,19 @@ function CockpitChrome({
   // the user reinstalls and a fresh worker spawns. See agent_compat.rs.
   if (state.incompatibleAgent) {
     return (
-      <div className="flex h-full flex-col bg-surface-900 text-text-primary">
+      <div
+        className="flex h-full flex-col bg-surface-900 text-text-primary"
+        style={rootStyle}
+      >
         <StartupErrorScreen detail={state.incompatibleAgent} />
       </div>
     );
   }
   return (
-    <div className="flex h-full flex-col bg-surface-900 text-text-primary">
+    <div
+      className="flex h-full flex-col bg-surface-900 text-text-primary"
+      style={rootStyle}
+    >
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection

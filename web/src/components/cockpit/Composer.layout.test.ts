@@ -1,13 +1,13 @@
-// Layout-decision tests for the cockpit composer's outer wrapper added
-// in #1143. The pure helper lets us check the className + inline style
-// across keyboard-open / keyboard-closed without mounting the whole
-// composer + assistant-ui runtime.
+// Layout-decision tests for the cockpit composer's outer wrapper. The
+// pure helper lets us check the className + inline style across
+// keyboard-open / keyboard-closed without mounting the whole composer +
+// assistant-ui runtime.
 
 import { describe, expect, it } from "vitest";
 
 import { composerWrapperLayout } from "./Composer";
 
-describe("composerWrapperLayout (#1143)", () => {
+describe("composerWrapperLayout", () => {
   it("uses pb-3 and no inline style when the soft keyboard is closed", () => {
     const layout = composerWrapperLayout({ keyboardOpen: false });
     expect(layout.className).toContain("pb-3");
@@ -15,13 +15,14 @@ describe("composerWrapperLayout (#1143)", () => {
     expect(layout.style).toBeUndefined();
   });
 
-  it("drops to pb-0 and cancels safe-area-inset-bottom when the keyboard is open", () => {
+  it("drops to pb-0 when the keyboard is open so the composer butts up against the keyboard top", () => {
+    // CockpitView pads its root by keyboardOffset to lift the composer above
+    // the keyboard; the composer's own pb-3 would re-introduce a visible
+    // gap between the composer border and the keyboard top, so drop it.
     const layout = composerWrapperLayout({ keyboardOpen: true });
     expect(layout.className).toContain("pb-0");
     expect(layout.className).not.toContain("pb-3");
-    expect(layout.style).toEqual({
-      marginBottom: "calc(-1 * env(safe-area-inset-bottom))",
-    });
+    expect(layout.style).toBeUndefined();
   });
 
   it("preserves shared base classes regardless of keyboard state", () => {

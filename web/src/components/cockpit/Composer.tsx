@@ -94,13 +94,14 @@ export function decideBeforeInputAction(
   return "newline";
 }
 
-/** Wrapper class + inline style for the composer's outer <div>. When the
- *  soft keyboard is open we drop the bottom padding and apply a negative
- *  bottom margin equal to the App root's safe-area-inset-bottom so the
- *  composer sits flush with the top of the keyboard instead of leaving a
- *  visible gap (the home-indicator inset is physically occluded by the
- *  keyboard anyway). Extracted as a pure helper so the layout decision
- *  can be unit-tested without mounting the whole composer. See #1143. */
+/** Wrapper class + inline style for the composer's outer <div>. The
+ *  composer is the flex-bottom child of the cockpit view; CockpitView
+ *  applies `paddingBottom: keyboardOffset` to its root when the soft
+ *  keyboard is open, which shrinks the inner flex column so the composer
+ *  sits flush with the keyboard top. We drop our own `pb-3` to `pb-0`
+ *  there so the composer's bottom border butts up against the keyboard
+ *  top with no visible gap. Extracted as a pure helper so the layout
+ *  decision can be unit-tested without mounting the whole composer. */
 export function composerWrapperLayout(opts: { keyboardOpen: boolean }): {
   className: string;
   style: React.CSSProperties | undefined;
@@ -110,9 +111,7 @@ export function composerWrapperLayout(opts: { keyboardOpen: boolean }): {
       "border-t border-surface-800 bg-surface-900 px-4 pt-3",
       opts.keyboardOpen ? "pb-0" : "pb-3",
     ].join(" "),
-    style: opts.keyboardOpen
-      ? { marginBottom: "calc(-1 * env(safe-area-inset-bottom))" }
-      : undefined,
+    style: undefined,
   };
 }
 
