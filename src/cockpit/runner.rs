@@ -272,6 +272,36 @@ pub async fn run(args: CockpitRunnerArgs) -> Result<()> {
                 session = %session_id,
                 "shutdown signal received; terminating agent"
             );
+            // SIGKILL the agent's whole process group, not just the
+            // immediate child. Necessary because claude-agent-acp
+            // (node) spawns the bundled `claude` binary as its own
+            // child; SIGKILL on the node parent leaves `claude`
+            // reparented to init, leaking an active API session.
+            // `process_group(0)` at spawn made the agent its own
+            // group leader, so killpg(child_pid, SIGKILL) reaps the
+            // whole subtree atomically. Falls back to
+            // `start_kill()` (single-child SIGKILL) if the PID is
+            // unavailable (race with prior reap) or the killpg
+            // syscall fails; the subsequent `wait` is the actual
+            // synchronisation point either way.
+            #[cfg(unix)]
+            if let Some(pid) = agent_child.id() {
+                use nix::sys::signal::{killpg, Signal};
+                use nix::unistd::Pid;
+                if let Err(e) = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL) {
+                    warn!(
+                        target: "cockpit.runner",
+                        session = %session_id,
+                        pid,
+                        error = %e,
+                        "killpg failed; falling back to direct child SIGKILL"
+                    );
+                    let _ = agent_child.start_kill();
+                }
+            } else {
+                let _ = agent_child.start_kill();
+            }
+            #[cfg(not(unix))]
             let _ = agent_child.start_kill();
             let _ = agent_child.wait().await;
         }
@@ -624,6 +654,15 @@ fn spawn_agent(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Put the agent in its own process group so a `killpg` on shutdown
+    // reaps the whole subtree (claude-agent-acp → bundled `claude`
+    // binary, MCP servers, etc). Without this, SIGKILL on the direct
+    // child kills only the node adapter; the `claude` grandchild is
+    // reparented to init and survives, leaking an API session + ~40MB
+    // RAM per stranded session. process_group(0) sets pgid = child pid,
+    // making the agent its own group leader.
+    #[cfg(unix)]
+    cmd.process_group(0);
     // Inherit env from the runner's launching daemon (env is already
     // filtered at the daemon-side spawn site in acp_client.rs).
     let mut child = cmd.spawn().with_context(|| format!("spawning {program}"))?;

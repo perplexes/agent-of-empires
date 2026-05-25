@@ -520,6 +520,42 @@ impl<S: BroadcastSink> Supervisor<S> {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+            // Deadline elapsed and the runner is still alive — its
+            // graceful shutdown handler is wedged (typical cause: the
+            // ACP connection task is stuck on an in-flight session/prompt
+            // that the agent never resolves). Escalate to SIGKILL on the
+            // runner's session, which the runner created via `setsid`
+            // when it was spawned. killpg(runner_pid) hits the runner's
+            // process group; the runner's child agent moved to its own
+            // group via spawn_agent's process_group(0), but the runner-
+            // side SIGTERM handler should have already reaped the agent
+            // before we got here. If the runner is wedged hard enough
+            // that the SIGTERM never landed, the agent + claude
+            // grandchildren leak — supervisor-side traversal of the
+            // session id is a follow-up; for now we at least reap the
+            // runner itself so its socket file releases and a fresh
+            // spawn can bind without colliding.
+            if super::worker_registry::is_pid_alive(pid) {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+                tracing::warn!(
+                    target: "cockpit.supervisor",
+                    session = %session_id,
+                    pid,
+                    deadline_secs = deadline.as_secs(),
+                    "runner did not exit within shutdown deadline; escalating to SIGKILL"
+                );
+                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                // Brief wait for the kernel to reap the process so the
+                // socket inode is free before the new spawn binds it.
+                let kill_start = std::time::Instant::now();
+                while kill_start.elapsed() < std::time::Duration::from_millis(500) {
+                    if !super::worker_registry::is_pid_alive(pid) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
             // Best-effort socket file removal: the new spawn will bind
             // <workers_dir>/<session_id>.sock, so a stale inode from
             // the old runner would collide. terminate_runner_for_session
