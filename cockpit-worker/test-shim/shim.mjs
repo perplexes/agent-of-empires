@@ -34,6 +34,12 @@ class ShimAgent {
     // assert the watchdog without waiting for CANCEL_ESCALATION_GRACE
     // to elapse.
     this._silentOrphanResolve = null;
+    // Resolver used by the IGNORE_CANCEL test mode: prompt() parks on
+    // a Promise that the cancel() handler deliberately does NOT
+    // resolve. The Rust test then verifies the cancel-escalation
+    // watchdog and the immediate-on-retry escalation path. The shim
+    // process is killed on test teardown via kill_on_drop.
+    this._ignoreCancelResolve = null;
   }
 
   async initialize(params) {
@@ -84,6 +90,29 @@ class ShimAgent {
     // Without the cancel handler we'd hang the test for the full
     // CANCEL_ESCALATION_GRACE; the explicit resolve keeps the test
     // under a second while still exercising the watchdog. See #1240.
+    // IGNORE_CANCEL reproduces the wedged-adapter shape exercised by
+    // tests/integration/cockpit_cancel_escalation.rs: the prompt parks
+    // forever and the shim's cancel() handler ignores the request.
+    // The Rust test then asserts (a) PromptRejected fires on a
+    // follow-up Prompt sent while `cancelling=true`, and (b) the
+    // connection task escalates to `Stopped { reason:
+    // "agent_unresponsive" }` and exits. An initial agent_message_chunk
+    // signals the prompt is in-flight so the test doesn't have to
+    // race the shim's prompt() arrival.
+    if (userText.includes("IGNORE_CANCEL")) {
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "in flight; will ignore cancel" },
+        },
+      });
+      await new Promise((resolve) => {
+        this._ignoreCancelResolve = resolve;
+      });
+      return { stopReason: "cancelled" };
+    }
+
     if (userText.includes("SILENT_ORPHAN")) {
       await this.connection.sessionUpdate({
         sessionId: params.sessionId,
@@ -458,7 +487,9 @@ class ShimAgent {
   async cancel(_params) {
     // Unstick the SILENT_ORPHAN park so prompt() returns and the
     // daemon's prompt_fut resolves. Other prompt branches finish
-    // synchronously so this is a no-op for them.
+    // synchronously so this is a no-op for them. IGNORE_CANCEL
+    // deliberately doesn't get resolved here so the daemon's
+    // cancel-escalation path is exercised end-to-end.
     if (this._silentOrphanResolve) {
       const resolve = this._silentOrphanResolve;
       this._silentOrphanResolve = null;
