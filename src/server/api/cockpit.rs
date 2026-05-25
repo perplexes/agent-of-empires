@@ -661,28 +661,49 @@ pub async fn cockpit_enable(
     }
     instance.cockpit_mode = true;
 
+    // Promote the agent-side session ID into `cockpit_acp_session_id`
+    // when we don't already have one. For Claude in tmux, AoE generates
+    // a UUID up-front and passes `--session-id <uuid>` so the on-disk
+    // transcript lives at `~/.claude/projects/<enc-cwd>/<uuid>.jsonl`.
+    // Reusing it as the ACP session id makes the worker `session/load`
+    // instead of `session/new`, so the model picks up where it left off
+    // in tmux instead of starting cold.
+    if instance.cockpit_acp_session_id.is_none() {
+        if let Some(uuid) = instance.agent_session_id.clone() {
+            instance.cockpit_acp_session_id = Some(uuid);
+        }
+    }
+
     // Persist before spawning so a crash mid-swap leaves us in the
     // declared end state, not a half-broken intermediate.
     //
     // The on-disk and in-memory updates mutate ONLY the cockpit-specific
-    // field (`cockpit_mode = true`). Wholesale replacement with a
-    // pre-lock snapshot would clobber concurrent writes to other
-    // fields (status, last_accessed, agent_session_id) made by the
-    // status poll loop or other handlers between the snapshot and the
-    // lock acquisition.
+    // fields (`cockpit_mode`, optionally `cockpit_acp_session_id`).
+    // Wholesale replacement with a pre-lock snapshot would clobber
+    // concurrent writes to other fields (status, last_accessed,
+    // agent_session_id) made by the status poll loop or other handlers
+    // between the snapshot and the lock acquisition.
+    let promoted_acp_id = instance.cockpit_acp_session_id.clone();
     {
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
             slot.cockpit_mode = true;
+            if slot.cockpit_acp_session_id.is_none() {
+                slot.cockpit_acp_session_id = promoted_acp_id.clone();
+            }
         }
     }
     let id_for_save = id.clone();
     let profile_for_save = profile.clone();
+    let promoted_for_save = promoted_acp_id.clone();
     let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let storage = crate::session::Storage::new(&profile_for_save)?;
         storage.update(|all, _groups| {
             if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
                 slot.cockpit_mode = true;
+                if slot.cockpit_acp_session_id.is_none() {
+                    slot.cockpit_acp_session_id = promoted_for_save.clone();
+                }
             }
             Ok(())
         })?;
@@ -696,6 +717,55 @@ pub async fn cockpit_enable(
         }
         Err(join_err) => {
             tracing::error!(target: "cockpit.switch", "save task panicked after enable: {join_err}");
+        }
+    }
+
+    // Import the agent's prior tmux transcript into the cockpit event
+    // store so the UI timeline shows the conversation that already
+    // happened, not an empty thread. Only runs when the store is
+    // currently empty for this session (so re-enables that retained
+    // their cockpit history don't double-import) and we have a Claude
+    // session UUID to find the JSONL.
+    if instance.tool == "claude" && state.cockpit_event_store.highest_seq(&id) == 0 {
+        if let Some(uuid) = instance.agent_session_id.clone() {
+            let event_store = state.cockpit_event_store.clone();
+            let project_path = instance.project_path.clone();
+            let id_for_import = id.clone();
+            let import_result = tokio::task::spawn_blocking(move || {
+                crate::cockpit::transcript_import::import_claude_transcript(
+                    &id_for_import,
+                    &project_path,
+                    &uuid,
+                    &event_store,
+                )
+            })
+            .await;
+            match import_result {
+                Ok(Ok(n)) if n > 0 => {
+                    state.cockpit_supervisor.hydrate_seqs([(id.clone(), n)]);
+                    tracing::info!(
+                        target: "cockpit.switch",
+                        session = %id,
+                        imported = n,
+                        "transcript imported on tmux→cockpit switch"
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        target: "cockpit.switch",
+                        session = %id,
+                        "transcript import failed: {e}"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "cockpit.switch",
+                        session = %id,
+                        "transcript import task panicked: {e}"
+                    );
+                }
+            }
         }
     }
 
@@ -809,25 +879,18 @@ pub async fn cockpit_disable(
     // drop it.
     state.cockpit_event_store.delete_session(&id);
     instance.cockpit_mode = false;
-    // Clear the stored ACP session id: the agent's transcript is
-    // tied to the cockpit-mode lifecycle. If the user re-enables
-    // cockpit later, the agent should start a fresh session/new
-    // rather than try to resume an id that's no longer relevant.
-    if instance.cockpit_acp_session_id.is_some() {
-        tracing::debug!(
-            target: "cockpit.switch",
-            session = %id,
-            "clearing cockpit_acp_session_id on disable"
-        );
-        instance.cockpit_acp_session_id = None;
-    }
+    // Preserve cockpit_acp_session_id across the disable so a future
+    // re-enable can resume the same agent conversation. The agent's
+    // own transcript on disk (e.g. ~/.claude/projects/.../*.jsonl) is
+    // not affected by the substrate switch; only AoE's cockpit event
+    // store was cleared above. Keeping the id lets cockpit_enable
+    // resume cleanly instead of starting a fresh session.
 
     // Persist + start tmux. start() now no longer short-circuits for
     // cockpit_mode, so it will create a fresh tmux session and run
     // the agent CLI in the pane.
     //
-    // The on-disk and in-memory updates mutate ONLY the cockpit-specific
-    // fields (`cockpit_mode = false`, `cockpit_acp_session_id = None`).
+    // The on-disk and in-memory updates mutate ONLY `cockpit_mode`.
     // Wholesale replacement with a pre-lock snapshot would clobber
     // concurrent writes to other fields made by the status poll loop or
     // other handlers between the snapshot and the lock acquisition.
@@ -835,7 +898,6 @@ pub async fn cockpit_disable(
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
             slot.cockpit_mode = false;
-            slot.cockpit_acp_session_id = None;
         }
     }
     let id_for_save = id.clone();
@@ -845,7 +907,6 @@ pub async fn cockpit_disable(
         storage.update(|all, _groups| {
             if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
                 slot.cockpit_mode = false;
-                slot.cockpit_acp_session_id = None;
             }
             Ok(())
         })?;

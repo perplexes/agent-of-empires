@@ -41,6 +41,7 @@ import { Composer } from "./Composer";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
 import { RateLimitRecoveryModal } from "./RateLimitRecoveryModal";
 import { Markdown } from "./Markdown";
+import { SwitchSubstrateAction } from "./SwitchSubstrateAction";
 import {
   isQueuedPromptLong,
   queuedStripLayout,
@@ -248,7 +249,17 @@ function CockpitChrome({
     );
   }
   return (
-    <div className="flex h-full flex-col bg-surface-900 text-text-primary">
+    <div className="relative flex h-full flex-col bg-surface-900 text-text-primary">
+      {/* Top-right substrate switch — mirrors TerminalView. Always
+          rendered in cockpit mode: even with the master switch off,
+          users in cockpit need a path back to terminal. */}
+      <div className="absolute right-2 top-2 z-10">
+        <SwitchSubstrateAction
+          sessionId={sessionId}
+          cockpitMode={true}
+          variant="icon"
+        />
+      </div>
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection
