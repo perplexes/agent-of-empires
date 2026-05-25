@@ -128,15 +128,16 @@ export function SwitchSubstrateAction({
             <p className="mt-2 text-xs leading-relaxed text-text-muted">
               {cockpitMode ? (
                 <>
-                  The cockpit conversation history will be discarded and the
-                  agent will restart in a fresh tmux pane. Open files and
-                  worktree state are preserved.
+                  The agent will restart in a fresh tmux pane. Its conversation
+                  transcript is preserved on disk and can be resumed when you
+                  switch back. Open files and worktree state are preserved.
                 </>
               ) : (
                 <>
                   The current tmux scrollback will be lost and the agent will
-                  restart as an ACP server. Open files and worktree state are
-                  preserved.
+                  restart as an ACP server. Prior conversation is imported
+                  from the agent's transcript when available. Open files and
+                  worktree state are preserved.
                 </>
               )}
             </p>

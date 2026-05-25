@@ -32,6 +32,8 @@ pub mod sandbox;
 pub mod state;
 pub mod supervisor;
 pub mod terminal_handler;
+#[cfg(feature = "serve")]
+pub mod transcript_import;
 pub mod worker_registry;
 
 pub use agent_registry::{AgentRegistry, AgentSpec};
