@@ -272,38 +272,7 @@ pub async fn run(args: CockpitRunnerArgs) -> Result<()> {
                 session = %session_id,
                 "shutdown signal received; terminating agent"
             );
-            // SIGKILL the agent's whole process group, not just the
-            // immediate child. Necessary because claude-agent-acp
-            // (node) spawns the bundled `claude` binary as its own
-            // child; SIGKILL on the node parent leaves `claude`
-            // reparented to init, leaking an active API session.
-            // `process_group(0)` at spawn made the agent its own
-            // group leader, so killpg(child_pid, SIGKILL) reaps the
-            // whole subtree atomically. Falls back to
-            // `start_kill()` (single-child SIGKILL) if the PID is
-            // unavailable (race with prior reap) or the killpg
-            // syscall fails; the subsequent `wait` is the actual
-            // synchronisation point either way.
-            #[cfg(unix)]
-            if let Some(pid) = agent_child.id() {
-                use nix::sys::signal::{killpg, Signal};
-                use nix::unistd::Pid;
-                if let Err(e) = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL) {
-                    warn!(
-                        target: "cockpit.runner",
-                        session = %session_id,
-                        pid,
-                        error = %e,
-                        "killpg failed; falling back to direct child SIGKILL"
-                    );
-                    let _ = agent_child.start_kill();
-                }
-            } else {
-                let _ = agent_child.start_kill();
-            }
-            #[cfg(not(unix))]
-            let _ = agent_child.start_kill();
-            let _ = agent_child.wait().await;
+            terminate_agent_subtree(&mut agent_child, &session_id).await;
         }
         _ = accept_loop => {
             warn!(target: "cockpit.runner", session = %session_id, "accept loop exited unexpectedly");
@@ -654,15 +623,6 @@ fn spawn_agent(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Put the agent in its own process group so a `killpg` on shutdown
-    // reaps the whole subtree (claude-agent-acp → bundled `claude`
-    // binary, MCP servers, etc). Without this, SIGKILL on the direct
-    // child kills only the node adapter; the `claude` grandchild is
-    // reparented to init and survives, leaking an API session + ~40MB
-    // RAM per stranded session. process_group(0) sets pgid = child pid,
-    // making the agent its own group leader.
-    #[cfg(unix)]
-    cmd.process_group(0);
     // Inherit env from the runner's launching daemon (env is already
     // filtered at the daemon-side spawn site in acp_client.rs).
     let mut child = cmd.spawn().with_context(|| format!("spawning {program}"))?;
@@ -676,6 +636,79 @@ fn spawn_agent(
         .ok_or_else(|| anyhow!("agent has no stdout"))?;
     let stderr = child.stderr.take();
     Ok((child, stdin, stdout, stderr))
+}
+
+#[cfg(unix)]
+async fn terminate_agent_subtree(agent_child: &mut Child, session_id: &str) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    if agent_child.id().is_none() {
+        let _ = agent_child.start_kill();
+        let _ = agent_child.wait().await;
+        return;
+    }
+
+    let mut victims = pids_in_own_session_excluding_self();
+    if victims.is_empty() {
+        if let Some(pid) = agent_child.id() {
+            victims.push(pid);
+        }
+    }
+
+    for victim in &victims {
+        let _ = kill(Pid::from_raw(*victim as i32), Signal::SIGKILL);
+    }
+    if let Some(pid) = agent_child.id() {
+        debug!(
+            target: "cockpit.runner",
+            session = %session_id,
+            pid,
+            victim_count = victims.len(),
+            "sent SIGKILL to agent session descendants"
+        );
+    }
+    let _ = agent_child.wait().await;
+}
+
+#[cfg(not(unix))]
+async fn terminate_agent_subtree(agent_child: &mut Child, _session_id: &str) {
+    let _ = agent_child.start_kill();
+    let _ = agent_child.wait().await;
+}
+
+#[cfg(unix)]
+fn pids_in_own_session_excluding_self() -> Vec<u32> {
+    use nix::unistd::{getsid, Pid};
+
+    let self_pid = std::process::id();
+    let self_pid_raw = self_pid as i32;
+    let Ok(own_sid) = getsid(Some(Pid::from_raw(self_pid_raw))) else {
+        return Vec::new();
+    };
+    let output = match std::process::Command::new("ps")
+        .args(["-A", "-o", "pid="])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+
+    let mut descendants = Vec::new();
+    for line in String::from_utf8_lossy(&output).lines() {
+        let Ok(pid_num) = line.trim().parse::<i32>() else {
+            continue;
+        };
+        if pid_num == self_pid_raw {
+            continue;
+        }
+        if let Ok(sid) = getsid(Some(Pid::from_raw(pid_num))) {
+            if sid == own_sid {
+                descendants.push(pid_num as u32);
+            }
+        }
+    }
+    descendants
 }
 
 #[cfg(unix)]

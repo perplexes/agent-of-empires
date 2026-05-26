@@ -1074,6 +1074,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // helper deletes the worker_registry entry, which
                     // makes `restart_decision` interpret it as a
                     // user-initiated stop and skip the respawn. See #1196.
+                    let restart_cause = if agent_unresponsive {
+                        RestartCause::InternalUnresponsive
+                    } else {
+                        RestartCause::TransportEnded
+                    };
                     if agent_unresponsive {
                         #[cfg(unix)]
                         {
@@ -1110,9 +1115,13 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         target: "cockpit.supervisor",
                                         session = %session_id,
                                         pid,
-                                        "wedged runner survived SIGTERM grace; escalating to SIGKILL"
+                                        "wedged runner survived SIGTERM grace; escalating to SIGKILL across session"
                                     );
-                                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                                    let session_pids = pids_in_runner_session(pid);
+                                    for victim in &session_pids {
+                                        let _ =
+                                            kill(Pid::from_raw(*victim as i32), Signal::SIGKILL);
+                                    }
                                     // One more brief tick for the kernel
                                     // to reap and the socket inode to
                                     // drop. We don't loop forever; spawn
@@ -1160,7 +1169,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         return;
                     }
                     let respawn_config: SpawnConfig =
-                        match restart_decision(&workers, &session_id).await {
+                        match restart_decision(&workers, &session_id, restart_cause).await {
                             RestartDecision::Respawn(cfg) => {
                                 info!(
                                     target: "cockpit.supervisor",
@@ -1937,8 +1946,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 /// runner becomes its own session leader at spawn (via `setsid()` in
 /// `acp_client::spawn_runner_detached`), so the whole agent subtree
 /// (node ACP adapter, bundled `claude` binary, any MCP servers) shares
-/// the runner's session id even though `spawn_agent`'s
-/// `process_group(0)` puts the agent in a separate process group.
+/// the runner's session id.
 ///
 /// Implementation: shell out to POSIX `ps -A -o pid=` to enumerate all
 /// PIDs (no `nix` crate API for this; sysinfo/libproc would add a
@@ -2017,9 +2025,16 @@ enum RestartDecision {
     UserStopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartCause {
+    TransportEnded,
+    InternalUnresponsive,
+}
+
 async fn restart_decision(
     workers: &Arc<Mutex<HashMap<String, WorkerHandle>>>,
     session_id: &str,
+    cause: RestartCause,
 ) -> RestartDecision {
     let mut guard = workers.lock().await;
     let Some(handle) = guard.get_mut(session_id) else {
@@ -2048,7 +2063,7 @@ async fn restart_decision(
         handle.kind,
         WorkerKind::Runner { .. } | WorkerKind::Attached
     );
-    if runner_managed {
+    if runner_managed && cause != RestartCause::InternalUnresponsive {
         let registry_gone = matches!(super::worker_registry::load(session_id), Ok(None));
         if registry_gone {
             debug!(
@@ -2377,14 +2392,15 @@ mod tests {
         }
 
         for i in 0..MAX_RESPAWNS_IN_WINDOW {
-            let decision = restart_decision(&sup.workers, "s-1").await;
+            let decision =
+                restart_decision(&sup.workers, "s-1", RestartCause::TransportEnded).await;
             assert!(
                 matches!(decision, RestartDecision::Respawn(_)),
                 "decision #{i} should be Respawn",
             );
         }
         // One more push past the threshold should burn the budget.
-        let decision = restart_decision(&sup.workers, "s-1").await;
+        let decision = restart_decision(&sup.workers, "s-1", RestartCause::TransportEnded).await;
         assert!(matches!(decision, RestartDecision::BudgetBurned));
     }
 
@@ -2450,10 +2466,71 @@ mod tests {
         }
         // No registry entry for "s-stop" — production code reads this
         // as a user-initiated stop signal.
-        let decision = restart_decision(&sup.workers, "s-stop").await;
+        let decision = restart_decision(&sup.workers, "s-stop", RestartCause::TransportEnded).await;
         assert!(
             matches!(decision, RestartDecision::UserStopped),
             "expected UserStopped when registry entry is absent, got {decision:?}"
+        );
+    }
+
+    /// Internal watchdog recovery also sees the registry disappear, because
+    /// the runner deletes its own record during graceful SIGTERM cleanup.
+    /// That must still respawn, unlike `aoe cockpit stop|kill`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_decision_respawns_internal_unresponsive_when_registry_deleted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `#[serial]`; this mirrors the registry
+        // isolation used by the neighboring restart-decision tests.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink);
+        let dummy_spec = AgentSpec {
+            command: "/bin/true".into(),
+            args: vec![],
+            description: "test fixture".into(),
+            env_allowlist: None,
+        };
+        let dummy_config = SpawnConfig {
+            agent_key: "claude".into(),
+            spec: dummy_spec,
+            cwd: std::env::temp_dir(),
+            additional_dirs: vec![],
+            provider_env: vec![],
+            socket_path: Some(tmp.path().join("dummy.sock")),
+            stored_acp_session_id: Some("resume-me".into()),
+            sandbox_info: None,
+            source_profile: None,
+        };
+        {
+            let mut workers = sup.workers.lock().await;
+            let (client, _tx) = AcpClient::fake_for_test(CockpitSessionId("s-internal".into()));
+            let drain = tokio::spawn(async {});
+            workers.insert(
+                "s-internal".into(),
+                WorkerHandle {
+                    client: Arc::new(client),
+                    drain_task: drain,
+                    restart_history: vec![],
+                    kind: WorkerKind::Runner {
+                        spawn_config: Box::new(dummy_config),
+                    },
+                },
+            );
+        }
+
+        let decision = restart_decision(
+            &sup.workers,
+            "s-internal",
+            RestartCause::InternalUnresponsive,
+        )
+        .await;
+        assert!(
+            matches!(decision, RestartDecision::Respawn(_)),
+            "expected Respawn for internal watchdog recovery, got {decision:?}"
         );
     }
 
