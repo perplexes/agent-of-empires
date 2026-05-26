@@ -524,30 +524,34 @@ impl<S: BroadcastSink> Supervisor<S> {
             // graceful shutdown handler is wedged (typical cause: the
             // ACP connection task is stuck on an in-flight session/prompt
             // that the agent never resolves). Escalate to SIGKILL on the
-            // runner's session, which the runner created via `setsid`
-            // when it was spawned. killpg(runner_pid) hits the runner's
-            // process group; the runner's child agent moved to its own
-            // group via spawn_agent's process_group(0), but the runner-
-            // side SIGTERM handler should have already reaped the agent
-            // before we got here. If the runner is wedged hard enough
-            // that the SIGTERM never landed, the agent + claude
-            // grandchildren leak — supervisor-side traversal of the
-            // session id is a follow-up; for now we at least reap the
-            // runner itself so its socket file releases and a fresh
-            // spawn can bind without colliding.
+            // whole runner session, not just the runner PID. Snapshot
+            // descendants first via `pids_in_runner_session` (uses
+            // `getsid` against the runner's setsid-created session), then
+            // SIGKILL descendants before the leader so they don't get
+            // briefly reparented to init mid-kill. Without the descendant
+            // sweep, a hard-wedged runner would leave its node ACP
+            // adapter + bundled `claude` binary alive after the SIGKILL
+            // hits the runner alone, leaking an API session per stranded
+            // grandchild. The runner.rs SIGTERM handler covers the common
+            // case (graceful shutdown reaps the agent's process group);
+            // this branch is the last-resort path.
             if super::worker_registry::is_pid_alive(pid) {
                 use nix::sys::signal::{kill, Signal};
                 use nix::unistd::Pid;
+                let session_pids = pids_in_runner_session(pid);
                 tracing::warn!(
                     target: "cockpit.supervisor",
                     session = %session_id,
                     pid,
+                    descendant_count = session_pids.len().saturating_sub(1),
                     deadline_secs = deadline.as_secs(),
-                    "runner did not exit within shutdown deadline; escalating to SIGKILL"
+                    "runner did not exit within shutdown deadline; escalating to SIGKILL across session"
                 );
-                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
-                // Brief wait for the kernel to reap the process so the
-                // socket inode is free before the new spawn binds it.
+                for victim in &session_pids {
+                    let _ = kill(Pid::from_raw(*victim as i32), Signal::SIGKILL);
+                }
+                // Brief wait for the kernel to reap so the socket inode
+                // is free before the new spawn binds it.
                 let kill_start = std::time::Instant::now();
                 while kill_start.elapsed() < std::time::Duration::from_millis(500) {
                     if !super::worker_registry::is_pid_alive(pid) {
@@ -1927,6 +1931,54 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         restart_pending
     }
+}
+
+/// Enumerate every PID whose session leader is `leader_pid`. The cockpit
+/// runner becomes its own session leader at spawn (via `setsid()` in
+/// `acp_client::spawn_runner_detached`), so the whole agent subtree
+/// (node ACP adapter, bundled `claude` binary, any MCP servers) shares
+/// the runner's session id even though `spawn_agent`'s
+/// `process_group(0)` puts the agent in a separate process group.
+///
+/// Implementation: shell out to POSIX `ps -A -o pid=` to enumerate all
+/// PIDs (no `nix` crate API for this; sysinfo/libproc would add a
+/// dependency for one call), then `getsid()` each one via nix. Returns
+/// `leader_pid` last so callers SIGKILL descendants first; killing the
+/// session leader before its children leaves them briefly reparented to
+/// init, which a racing `getsid` against a recycled PID could later
+/// mis-classify.
+///
+/// Best-effort: any `ps` or `getsid` failure means we return what we
+/// found so far, never blocking the caller's escalation path.
+#[cfg(unix)]
+fn pids_in_runner_session(leader_pid: u32) -> Vec<u32> {
+    use nix::unistd::{getsid, Pid};
+    let leader = Pid::from_raw(leader_pid as i32);
+    let output = match std::process::Command::new("ps")
+        .args(["-A", "-o", "pid="])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return vec![leader_pid],
+    };
+    let mut descendants: Vec<u32> = Vec::new();
+    for line in String::from_utf8_lossy(&output).lines() {
+        let Ok(pid_num) = line.trim().parse::<i32>() else {
+            continue;
+        };
+        if pid_num as u32 == leader_pid {
+            continue;
+        }
+        let pid = Pid::from_raw(pid_num);
+        if let Ok(sid) = getsid(Some(pid)) {
+            if sid == leader {
+                descendants.push(pid_num as u32);
+            }
+        }
+    }
+    // Leader last so descendants get SIGKILLed first.
+    descendants.push(leader_pid);
+    descendants
 }
 
 /// SIGTERM the per-session runner if its registry entry has a live PID,
