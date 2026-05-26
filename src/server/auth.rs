@@ -522,12 +522,49 @@ pub async fn auth_middleware(
         );
     }
 
-    // Token gate disabled (--auth=none or --auth=passphrase). Insert a
-    // zeroed AuthenticatedTokenHash so handlers that extract the
-    // extension still succeed; all token-less clients share the same
-    // "owner" value. Then either bypass entirely (--auth=none) or
-    // hand off to the passphrase wall (--auth=passphrase).
+    // Token gate disabled (--auth=none, --auth=passphrase, or
+    // --auth=tailnet). Insert a zeroed AuthenticatedTokenHash so
+    // handlers that extract the extension still succeed; all token-less
+    // clients share the same "owner" value. Then either reject by IP
+    // (--auth=tailnet), bypass entirely (--auth=none), or hand off to
+    // the passphrase wall (--auth=passphrase).
     if state.token_manager.is_no_auth().await {
+        // Tailnet gate: only loopback and Tailscale CGNAT addresses
+        // (100.64.0.0/10) reach the handler. This is what makes
+        // `--auth=tailnet` safe to combine with a non-loopback bind:
+        // the daemon may be listening on 0.0.0.0, but the application
+        // layer 401s a request from any LAN peer that found the
+        // socket. Loopback always passes so `curl localhost:port`
+        // from the same host keeps working; remember that
+        // `behind_proxy` is disallowed for tailnet mode (validation
+        // in cli/serve.rs), so `client_ip` here is the actual
+        // socket peer, not an XFF claim.
+        if state.tailnet_gate {
+            let ip_v4 = match client_ip {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+            };
+            let allowed = client_ip.is_loopback()
+                || ip_v4.is_some_and(|v4| {
+                    matches!(
+                        super::classify_ip(v4),
+                        super::IpKind::Tailscale | super::IpKind::Loopback
+                    )
+                });
+            if !allowed {
+                tracing::warn!(
+                    target: "auth.tailnet",
+                    ip = %client_ip,
+                    path = %request.uri().path(),
+                    "tailnet gate rejected non-tailnet source IP"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    "tailnet auth: source IP not on tailnet",
+                )
+                    .into_response();
+            }
+        }
         static NO_AUTH_LOGGED: std::sync::Once = std::sync::Once::new();
         if state.login_manager.is_enabled() {
             NO_AUTH_LOGGED.call_once(|| {

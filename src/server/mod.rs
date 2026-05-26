@@ -251,6 +251,14 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub devices: RwLock<Vec<DeviceInfo>>,
     pub behind_tunnel: bool,
+    /// True when the daemon was started with `--auth=tailnet` (or its
+    /// `--tailnet` shorthand). The auth middleware's no-token bypass
+    /// then includes a source-IP filter: loopback and Tailscale CGNAT
+    /// (100.64.0.0/10) pass; everything else gets 401. Lets a mobile
+    /// device on the tailnet hit the dashboard with no token URL while
+    /// still keeping LAN peers (regardless of how the daemon was
+    /// bound) locked out at the application layer.
+    pub tailnet_gate: bool,
     /// Per-instance mutex guarding mutations that must not interleave
     /// (e.g. `ensure_session` decide-and-restart). Entries are created on
     /// first use and live for the lifetime of the process — there are only
@@ -427,6 +435,13 @@ pub struct ServerConfig<'a> {
     pub host: &'a str,
     pub port: u16,
     pub no_auth: bool,
+    /// True when `--auth=tailnet` is active. The token gate is off
+    /// (same as `no_auth`), but the auth middleware enforces an
+    /// IP-level filter that 401s any request whose source isn't
+    /// loopback or in the Tailscale CGNAT range (100.64.0.0/10).
+    /// Set independently from `no_auth` so the middleware can branch
+    /// on which "no-token" mode is in effect.
+    pub tailnet_gate: bool,
     pub read_only: bool,
     pub remote: bool,
     pub tunnel_name: Option<&'a str>,
@@ -448,6 +463,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         host,
         port,
         no_auth,
+        tailnet_gate,
         read_only,
         remote,
         tunnel_name,
@@ -580,6 +596,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         rate_limiter: Arc::clone(&rate_limiter),
         devices: RwLock::new(Vec::new()),
         behind_tunnel: remote || behind_proxy,
+        tailnet_gate,
         instance_locks: RwLock::new(std::collections::HashMap::new()),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
@@ -739,10 +756,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
         // Collect labeled URLs in preference order (Tailscale > LAN > localhost).
         // When bound to 0.0.0.0 we're reachable on all three; on a specific
-        // host we just surface that one.
+        // host we just surface that one. In `tailnet_gate` mode the daemon
+        // is bound 0.0.0.0 but the auth middleware will 401 any LAN peer
+        // that finds the socket — drop LAN URLs from the list so the user
+        // doesn't paste one only to get a 403 from their phone.
         let labeled_urls: Vec<(IpKind, String)> = if host == "0.0.0.0" {
             let mut urls: Vec<(IpKind, String)> = discover_tagged_ips()
                 .into_iter()
+                .filter(|(kind, _)| !tailnet_gate || matches!(kind, IpKind::Tailscale))
                 .map(|(kind, ip)| (kind, make_url(&ip.to_string())))
                 .collect();
             urls.push((IpKind::Loopback, make_url("localhost")));

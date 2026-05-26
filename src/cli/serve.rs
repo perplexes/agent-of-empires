@@ -12,12 +12,20 @@ use std::sync::Mutex;
 /// login wall as the sole human gate (useful behind a reverse proxy
 /// where pasting a token URL on mobile is too high friction).
 /// `None` disables both, equivalent to legacy `--no-auth`.
+/// `Tailnet` disables the token gate AND drops the loopback-only
+/// restriction normally enforced by `None`, but the auth middleware
+/// rejects any request whose source IP isn't loopback or in the
+/// Tailscale CGNAT range (100.64.0.0/10). Intended for single-user
+/// tailnet-only deployments where the tailnet itself is the trust
+/// boundary, so mobile devices on the tailnet can reach the dashboard
+/// with no token URL to paste.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub enum AuthMode {
     Token,
     Passphrase,
     None,
+    Tailnet,
 }
 
 impl AuthMode {
@@ -30,6 +38,7 @@ impl AuthMode {
             AuthMode::Token => "token",
             AuthMode::Passphrase => "passphrase",
             AuthMode::None => "none",
+            AuthMode::Tailnet => "tailnet",
         }
     }
 }
@@ -47,15 +56,29 @@ pub struct ServeArgs {
 
     /// Authentication mode: `token` (default, random URL token),
     /// `passphrase` (no token URL, passphrase login wall only),
-    /// or `none` (no auth at all, loopback-only unless --behind-proxy).
-    /// Mutually exclusive with --no-auth (which aliases --auth=none).
-    #[arg(long, value_enum, conflicts_with = "no_auth")]
+    /// `none` (no auth at all, loopback-only unless --behind-proxy),
+    /// or `tailnet` (no token URL; daemon rejects requests whose
+    /// source IP isn't loopback or in the Tailscale CGNAT range
+    /// 100.64.0.0/10). Mutually exclusive with --no-auth (which
+    /// aliases --auth=none) and --tailnet (which aliases --auth=tailnet
+    /// plus auto-binds to the local tailnet IP).
+    #[arg(long, value_enum, conflicts_with_all = ["no_auth", "tailnet"])]
     pub auth: Option<AuthMode>,
 
     /// Disable authentication (only allowed with localhost binding).
     /// Alias for --auth=none.
     #[arg(long)]
     pub no_auth: bool,
+
+    /// Shorthand for `--auth=tailnet` plus auto-bind to the local
+    /// Tailscale IP. Refuses to start if no `100.x.y.z` address is
+    /// found on any interface (Tailscale not installed, daemon down,
+    /// or signed out). Intended for single-user tailnet deployments
+    /// where the tailnet itself is the trust boundary — no token URLs,
+    /// no passphrase, but the daemon still 401s any request whose
+    /// source IP isn't loopback or in the Tailscale CGNAT range.
+    #[arg(long, conflicts_with_all = ["no_auth", "passphrase", "behind_proxy", "remote"])]
+    pub tailnet: bool,
 
     /// Mark this server as sitting behind a reverse proxy that
     /// terminates TLS upstream. Sets cookies as `; Secure` and trusts
@@ -159,16 +182,32 @@ fn host_is_localhost(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Resolve the effective `AuthMode` from the two CLI surfaces
-/// (`--auth=<mode>` and the legacy `--no-auth` alias). Clap's
-/// `conflicts_with` already rejects passing both, so the
-/// `(Some, true)` arm is unreachable in practice.
-fn resolve_auth_mode(auth: Option<AuthMode>, no_auth: bool) -> AuthMode {
-    match (auth, no_auth) {
-        (Some(mode), false) => mode,
-        (None, true) => AuthMode::None,
-        (None, false) => AuthMode::Token,
-        (Some(_), true) => unreachable!("clap conflicts_with prevents this"),
+/// Find a local IPv4 address in the Tailscale CGNAT range
+/// (100.64.0.0/10) across all interfaces. Used by `--tailnet` /
+/// `--auth=tailnet` to auto-pick a bind address that's only reachable
+/// from the tailnet. Returns `None` when Tailscale isn't running or
+/// the host isn't signed in. First match wins; multi-tailnet hosts are
+/// vanishingly rare in practice.
+fn detect_local_tailnet_ip() -> Option<std::net::Ipv4Addr> {
+    crate::server::discover_tagged_ips()
+        .into_iter()
+        .find(|(kind, _)| matches!(kind, crate::server::IpKind::Tailscale))
+        .map(|(_, ip)| ip)
+}
+
+/// Resolve the effective `AuthMode` from the three CLI surfaces:
+/// `--auth=<mode>` (explicit), `--no-auth` (alias for `--auth=none`),
+/// and `--tailnet` (alias for `--auth=tailnet` plus host auto-bind,
+/// handled by the caller). Clap's `conflicts_with_all` already
+/// rejects passing more than one, so the multi-true arms are
+/// unreachable in practice but matched defensively.
+fn resolve_auth_mode(auth: Option<AuthMode>, no_auth: bool, tailnet: bool) -> AuthMode {
+    match (auth, no_auth, tailnet) {
+        (Some(mode), false, false) => mode,
+        (None, true, false) => AuthMode::None,
+        (None, false, true) => AuthMode::Tailnet,
+        (None, false, false) => AuthMode::Token,
+        _ => unreachable!("clap conflicts_with prevents this"),
     }
 }
 
@@ -200,14 +239,17 @@ fn validate_auth_combination(
     }
 
     // Reduced-auth modes on a non-loopback bind require an upstream
-    // proxy that terminates TLS.
+    // proxy that terminates TLS. Tailnet mode is exempt: the daemon
+    // enforces its own IP filter at the auth-middleware layer, so a
+    // non-loopback bind is the whole point.
     if matches!(auth_mode, AuthMode::None | AuthMode::Passphrase) && !is_localhost && !behind_proxy
     {
         bail!(
             "Refusing to start with --auth={} on {}.\n\
              Reduced-auth modes on a non-loopback bind require --behind-proxy,\n\
              which signals that an upstream reverse proxy terminates TLS and\n\
-             forwards the client IP via X-Forwarded-For / cf-connecting-ip.",
+             forwards the client IP via X-Forwarded-For / cf-connecting-ip.\n\
+             For a tailnet-only deployment with no token URL, use --tailnet.",
             auth_mode.as_cli_str(),
             host
         );
@@ -216,8 +258,13 @@ fn validate_auth_combination(
     // Block reduced-auth with --remote: --remote auto-spawns a public
     // ingress and mandates token + passphrase. Collapsing the token
     // away (or dropping auth entirely) on a publicly-reachable tunnel
-    // is never the intent.
-    if matches!(auth_mode, AuthMode::None | AuthMode::Passphrase) && remote {
+    // is never the intent. Tailnet mode is also blocked here because
+    // --remote's public ingress would bypass the tailnet IP gate.
+    if matches!(
+        auth_mode,
+        AuthMode::None | AuthMode::Passphrase | AuthMode::Tailnet
+    ) && remote
+    {
         bail!(
             "Refusing to start with --auth={} in remote mode.\n\
              --remote exposes the dashboard to the public internet and requires\n\
@@ -442,9 +489,47 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         }
     }
 
-    let is_localhost = host_is_localhost(&args.host);
+    let auth_mode = resolve_auth_mode(args.auth, args.no_auth, args.tailnet);
 
-    let auth_mode = resolve_auth_mode(args.auth, args.no_auth);
+    // Tailnet mode discovers the local Tailscale IP up front and uses
+    // it ONLY for URL display purposes — not for the socket bind. The
+    // bind is forced to 0.0.0.0 (silently, no SECURITY WARNING) so
+    // requests from loopback AND tailnet peers both reach the
+    // application layer; the auth middleware's `tailnet_gate` then
+    // 401s anything that isn't loopback or in 100.64.0.0/10, which
+    // includes LAN peers that found the socket. Two layers — kernel
+    // bind to all interfaces, application-layer IP filter — instead
+    // of one tight bind, so `curl localhost:port` from the same
+    // machine and `aoe url` / browser tabs from a tailnet phone both
+    // keep working. Refuse to start if no tailnet IP is present
+    // (Tailscale not installed, not running, or signed out): the user
+    // explicitly asked for a tailnet-only deployment, and silently
+    // falling back to LAN-without-the-gate would be a security
+    // regression.
+    let tailnet_ip = if args.tailnet || matches!(auth_mode, AuthMode::Tailnet) {
+        Some(detect_local_tailnet_ip().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No local Tailscale IP found (looked for 100.64.0.0/10 on all interfaces).\n\
+                 Start Tailscale.app, sign in, and re-run. `--tailnet` / `--auth=tailnet` \n\
+                 require an active tailnet membership; there's no fallback to loopback or LAN."
+            )
+        })?)
+    } else {
+        None
+    };
+
+    let host_effective = if tailnet_ip.is_some() {
+        if !args.host.is_empty() && args.host != "127.0.0.1" && args.host != "0.0.0.0" {
+            eprintln!(
+                "Note: --tailnet ignores --host {} and binds 0.0.0.0; the auth gate enforces the tailnet+loopback filter.",
+                args.host
+            );
+        }
+        "0.0.0.0".to_string()
+    } else {
+        args.host.clone()
+    };
+    let is_localhost = host_is_localhost(&host_effective);
 
     validate_auth_combination(
         auth_mode,
@@ -452,7 +537,7 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         is_localhost,
         args.behind_proxy,
         args.remote,
-        &args.host,
+        &host_effective,
     )?;
 
     // --behind-proxy + --remote is meaningless: --remote manages its
@@ -499,11 +584,14 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         // Force localhost since the tunnel connects to localhost
         "127.0.0.1".to_string()
     } else {
-        args.host.clone()
+        host_effective.clone()
     };
 
-    // Warn about security implications of network binding (non-remote, non-localhost)
-    if !is_localhost && !args.remote {
+    // Warn about security implications of network binding (non-remote, non-localhost).
+    // Tailnet mode also binds 0.0.0.0 but the auth gate at the
+    // application layer rejects non-tailnet+non-loopback peers, so the
+    // warning would mislead the user; skip it.
+    if !is_localhost && !args.remote && !matches!(auth_mode, AuthMode::Tailnet) {
         eprintln!("==========================================================");
         eprintln!("  SECURITY WARNING: Binding to {}", args.host);
         eprintln!("==========================================================");
@@ -570,7 +658,11 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         profile,
         host: &host,
         port: args.resolved_port(),
-        no_auth: matches!(auth_mode, AuthMode::Passphrase | AuthMode::None),
+        no_auth: matches!(
+            auth_mode,
+            AuthMode::Passphrase | AuthMode::None | AuthMode::Tailnet
+        ),
+        tailnet_gate: matches!(auth_mode, AuthMode::Tailnet),
         read_only: args.read_only,
         remote: args.remote,
         tunnel_name: args.tunnel_name.as_deref(),
@@ -921,23 +1013,32 @@ mod tests {
 
     #[test]
     fn resolve_auth_mode_defaults_to_token() {
-        assert_eq!(resolve_auth_mode(None, false), AuthMode::Token);
+        assert_eq!(resolve_auth_mode(None, false, false), AuthMode::Token);
     }
 
     #[test]
     fn resolve_auth_mode_no_auth_alias_maps_to_none() {
-        assert_eq!(resolve_auth_mode(None, true), AuthMode::None);
+        assert_eq!(resolve_auth_mode(None, true, false), AuthMode::None);
+    }
+
+    #[test]
+    fn resolve_auth_mode_tailnet_alias_maps_to_tailnet() {
+        assert_eq!(resolve_auth_mode(None, false, true), AuthMode::Tailnet);
     }
 
     #[test]
     fn resolve_auth_mode_explicit_wins() {
         assert_eq!(
-            resolve_auth_mode(Some(AuthMode::Passphrase), false),
+            resolve_auth_mode(Some(AuthMode::Passphrase), false, false),
             AuthMode::Passphrase
         );
         assert_eq!(
-            resolve_auth_mode(Some(AuthMode::None), false),
+            resolve_auth_mode(Some(AuthMode::None), false, false),
             AuthMode::None
+        );
+        assert_eq!(
+            resolve_auth_mode(Some(AuthMode::Tailnet), false, false),
+            AuthMode::Tailnet
         );
     }
 
@@ -1041,6 +1142,34 @@ mod tests {
             validate_auth_combination(AuthMode::Token, true, true, false, true, "127.0.0.1")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn validate_tailnet_non_loopback_ok_without_behind_proxy() {
+        // Tailnet mode is allowed on a non-loopback bind WITHOUT
+        // --behind-proxy: the daemon enforces its own IP filter at the
+        // application layer, so an external reverse proxy isn't part of
+        // the contract. This is the whole point of the mode.
+        assert!(validate_auth_combination(
+            AuthMode::Tailnet,
+            false,
+            false,
+            false,
+            false,
+            "100.81.0.1"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_tailnet_with_remote_rejected() {
+        // --remote spawns a public-internet ingress; that bypasses the
+        // tailnet IP filter so combining the two would silently expose
+        // an unauthenticated dashboard. Block at validation time.
+        let err =
+            validate_auth_combination(AuthMode::Tailnet, false, false, false, true, "100.81.0.1")
+                .unwrap_err();
+        assert!(err.to_string().contains("in remote mode"));
     }
 
     #[test]
